@@ -299,8 +299,12 @@ func wipeBytes8(b []uint8) {
 
 // buildContext 构造与“会话+参数版本+种子”绑定的保密放大上下文，
 // 避免不同会话派生出相同密钥。
+//
+// 域标签随参数版本变化：v1 恒为 "qkd-pa-v1"（冻结，老记录重放必须逐比特
+// 一致）；更新的版本使用各自标签。标签之后的拼装结构在所有版本间保持一致。
 func buildContext(sessionID string, v ParamsVersion, seed int64) []byte {
-	out := []byte("qkd-pa-v1")
+	label := paDomainLabel(v)
+	out := append([]byte(nil), label...)
 	out = append(out, 0)
 	out = append(out, []byte(sessionID)...)
 	out = append(out, 0)
@@ -310,6 +314,19 @@ func buildContext(sessionID string, v ParamsVersion, seed int64) []byte {
 		out = append(out, byte(seed>>(8*i)))
 	}
 	return out
+}
+
+// paDomainLabel 返回各参数版本的保密放大域标签；未知版本回退到 v2 标签，
+// 但未知版本在参数校验阶段就已被拒绝，正常路径不会走到这里。
+func paDomainLabel(v ParamsVersion) []byte {
+	switch v {
+	case ParamsV1:
+		return []byte("qkd-pa-v1")
+	case ParamsV2:
+		return []byte("qkd-pa-v2")
+	default:
+		return []byte("qkd-pa-v2")
+	}
 }
 
 // hashIndex 从字符串派生一个稳定的非负 int，用于随机流域分隔。

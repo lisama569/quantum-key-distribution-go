@@ -6,6 +6,11 @@ type ParamsVersion string
 
 const (
 	ParamsV1 ParamsVersion = "qkd-params-v1"
+	// ParamsV2 为更新的参数版本：协议流程与 v1 逐比特兼容
+	// （同参数+同种子+同信道的 v1 记录重放结论不变），仅默认取值升级
+	// （更大批量、更长密钥），并使用与版本绑定的保密放大域标签。
+	// v2 是新会话的默认版本；v1 继续受支持，老记录、老密钥不受影响。
+	ParamsV2 ParamsVersion = "qkd-params-v2"
 )
 
 // Params 是一次会话所用的版本化参数集合。
@@ -30,8 +35,14 @@ type Params struct {
 	BlockSize int `json:"block_size"`
 }
 
-// DefaultParams 返回 v1 默认参数。
+// DefaultParams 返回新会话的默认参数（当前为 v2）。
+// 需要固定旧行为的调用方可显式使用 DefaultParamsV1。
 func DefaultParams() Params {
+	return DefaultParamsV2()
+}
+
+// DefaultParamsV1 返回 v1 默认参数，继续受支持。
+func DefaultParamsV1() Params {
 	return Params{
 		Version:         ParamsV1,
 		N:               2048,
@@ -45,12 +56,42 @@ func DefaultParams() Params {
 	}
 }
 
+// DefaultParamsV2 返回 v2 默认参数：更大批量、更长最终密钥；
+// 协议各阶段的随机流派生与判定规则与 v1 相同，因此老记录可逐比特重放。
+func DefaultParamsV2() Params {
+	return Params{
+		Version:         ParamsV2,
+		N:               4096,
+		SampleFraction:  0.2,
+		QBERThreshold:   0.15,
+		NoiseRate:       0.03,
+		EavesdropRate:   0.0,
+		KeyBytes:        64,
+		ReconcilePasses: 24,
+		BlockSize:       32,
+	}
+}
+
+// SupportedVersion 报告 v 是否为本组件支持的参数版本。
+func SupportedVersion(v ParamsVersion) bool {
+	return v == ParamsV1 || v == ParamsV2
+}
+
 // withDefaults 用默认值填充零值字段并归一化版本号，
-// 不改变显式给出的字段。
+// 不改变显式给出的字段。零值 Version 归一为当前默认版本（v2）；
+// 显式的 v1/v2 各自套用本版本的默认值；未知版本不套默认、交由 Validate 拒绝。
 func (p Params) withDefaults() Params {
-	d := DefaultParams()
 	if p.Version == "" {
-		p.Version = d.Version
+		p.Version = DefaultParams().Version
+	}
+	var d Params
+	switch p.Version {
+	case ParamsV1:
+		d = DefaultParamsV1()
+	case ParamsV2:
+		d = DefaultParamsV2()
+	default:
+		return p
 	}
 	if p.N == 0 {
 		p.N = d.N
@@ -76,8 +117,8 @@ func (p Params) Validate() error {
 	if p.Version == "" {
 		p = p.withDefaults()
 	}
-	if p.Version != ParamsV1 {
-		return fail(ReasonConfigInvalid, "unsupported params version %q", p.Version)
+	if !SupportedVersion(p.Version) {
+		return fail(ReasonUnsupportedVersion, "unsupported params version %q", p.Version)
 	}
 	if p.N < 16 {
 		return fail(ReasonConfigInvalid, "n=%d too small (minimum 16)", p.N)

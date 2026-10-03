@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"sort"
 	"sync"
+	"time"
 )
 
 // RecordSchemaVersion 是会话归档记录自身的格式版本，
@@ -19,17 +20,22 @@ const (
 // SessionRecord 是一次会话（成功或失败）的可复现归档。
 // JSON 字段名保持稳定；未来新增字段只能追加，并在解析时兼容缺省。
 type SessionRecord struct {
-	Schema     RecordSchemaVersion `json:"schema"`
-	ID         string              `json:"id"`
-	ParamsVer  ParamsVersion       `json:"params_ver"`
-	Params     Params              `json:"params"`
-	Seed       int64               `json:"seed"`
-	Channel    ChannelConfig       `json:"channel"`
-	Success    bool                `json:"success"`
-	KeyID      string              `json:"key_id,omitempty"`
-	KeyBytes   int                 `json:"key_bytes,omitempty"`
-	FailReason FailureReason       `json:"fail_reason,omitempty"`
-	Stats      SessionStats        `json:"stats"`
+	Schema    RecordSchemaVersion `json:"schema"`
+	ID        string              `json:"id"`
+	ParamsVer ParamsVersion       `json:"params_ver"`
+	Params    Params              `json:"params"`
+	Seed      int64               `json:"seed"`
+	Channel   ChannelConfig       `json:"channel"`
+	Success   bool                `json:"success"`
+	KeyID     string              `json:"key_id,omitempty"`
+	KeyBytes  int                 `json:"key_bytes,omitempty"`
+	// Issued 标识成功会话的密钥是否确实写入了密钥库
+	// （容量不足等入库失败时为 false；老记录缺省按 success 归一）。
+	Issued     bool          `json:"issued,omitempty"`
+	IssuedAt   time.Time     `json:"issued_at,omitempty"` // 密钥入库时刻
+	NotAfter   time.Time     `json:"not_after,omitempty"` // 密钥有效期截止（零值表示长期有效）
+	FailReason FailureReason `json:"fail_reason,omitempty"`
+	Stats      SessionStats  `json:"stats"`
 }
 
 // History 保存历史会话记录，线程安全，支持按版本解析旧记录。
@@ -81,6 +87,9 @@ type legacyRecord struct {
 	Success       bool            `json:"success"`
 	KeyID         string          `json:"key_id"`
 	KeyBytes      int             `json:"key_bytes"`
+	Issued        *bool           `json:"issued"`
+	IssuedAt      time.Time       `json:"issued_at"`
+	NotAfter      time.Time       `json:"not_after"`
 	FailReason    string          `json:"fail_reason"`
 	AbortReason   string          `json:"abort_reason"` // 旧别名
 	Stats         json.RawMessage `json:"stats"`
@@ -120,6 +129,14 @@ func (r *SessionRecord) UnmarshalJSON(data []byte) error {
 	r.Success = l.Success
 	r.KeyID = l.KeyID
 	r.KeyBytes = l.KeyBytes
+	r.IssuedAt = l.IssuedAt
+	r.NotAfter = l.NotAfter
+	if l.Issued != nil {
+		r.Issued = *l.Issued
+	} else {
+		// 老记录没有 issued 字段：成功即视为已入库。
+		r.Issued = l.Success
+	}
 	r.FailReason = FailureReason(l.FailReason)
 	if r.FailReason == "" {
 		r.FailReason = FailureReason(l.AbortReason)
