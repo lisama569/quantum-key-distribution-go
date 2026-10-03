@@ -299,8 +299,15 @@ func wipeBytes8(b []uint8) {
 
 // buildContext 构造与“会话+参数版本+种子”绑定的保密放大上下文，
 // 避免不同会话派生出相同密钥。
+//
+// 域标签按参数版本区分：V1 必须保持原始标签 "qkd-pa-v1" 逐字节不变，
+// 以保证老记录重放逐比特一致；V2 使用 "qkd-pa-v2"。
 func buildContext(sessionID string, v ParamsVersion, seed int64) []byte {
-	out := []byte("qkd-pa-v1")
+	tag := "qkd-pa-v2"
+	if v == ParamsV1 {
+		tag = "qkd-pa-v1"
+	}
+	out := []byte(tag)
 	out = append(out, 0)
 	out = append(out, []byte(sessionID)...)
 	out = append(out, 0)

@@ -5,8 +5,19 @@ package qkd
 type ParamsVersion string
 
 const (
+	// ParamsV1：初始参数版本，继续受支持。
 	ParamsV1 ParamsVersion = "qkd-params-v1"
+	// ParamsV2：平滑升级的新参数版本，为新会话默认版本；
+	// V1 会话记录仍可解析/重放，V1 签发的密钥在 V2 下照常可用。
+	ParamsV2 ParamsVersion = "qkd-params-v2"
 )
+
+// supportedVersions 为当前实现支持的参数版本集合。
+// 老版本只增支持、永不移除；未知版本一律以 unsupported_version 拒绝。
+var supportedVersions = map[ParamsVersion]bool{
+	ParamsV1: true,
+	ParamsV2: true,
+}
 
 // Params 是一次会话所用的版本化参数集合。
 type Params struct {
@@ -30,8 +41,13 @@ type Params struct {
 	BlockSize int `json:"block_size"`
 }
 
-// DefaultParams 返回 v1 默认参数。
+// DefaultParams 返回当前默认版本参数（V2，见 DefaultParamsV2）。
 func DefaultParams() Params {
+	return DefaultParamsV2()
+}
+
+// DefaultParamsV1 返回 v1 默认参数；V1 继续受支持，老会话/老测试可用它钉住旧行为。
+func DefaultParamsV1() Params {
 	return Params{
 		Version:         ParamsV1,
 		N:               2048,
@@ -45,10 +61,33 @@ func DefaultParams() Params {
 	}
 }
 
-// withDefaults 用默认值填充零值字段并归一化版本号，
+// DefaultParamsV2 返回 v2 默认参数：更大批量、更严格阈值与更多纠错轮数，
+// 在同样的确定性随机源下获得更低的抽样噪声与更稳的纠错余量。
+func DefaultParamsV2() Params {
+	return Params{
+		Version:         ParamsV2,
+		N:               4096,
+		SampleFraction:  0.25,
+		QBERThreshold:   0.12,
+		NoiseRate:       0.02,
+		EavesdropRate:   0.0,
+		KeyBytes:        32,
+		ReconcilePasses: 24,
+		BlockSize:       32,
+	}
+}
+
+// withDefaults 用“该版本对应”的默认值填充零值字段并归一化版本号，
 // 不改变显式给出的字段。
 func (p Params) withDefaults() Params {
-	d := DefaultParams()
+	var d Params
+	switch p.Version {
+	case ParamsV2:
+		d = DefaultParamsV2()
+	default:
+		// 零值版本与 V1 一律按 V1 默认归一。
+		d = DefaultParamsV1()
+	}
 	if p.Version == "" {
 		p.Version = d.Version
 	}
@@ -72,12 +111,13 @@ func (p Params) withDefaults() Params {
 }
 
 // Validate 校验参数取值是否合法且版本受支持。
+// 未知版本返回 unsupported_version，与其它 config_invalid 失败可区分。
 func (p Params) Validate() error {
 	if p.Version == "" {
 		p = p.withDefaults()
 	}
-	if p.Version != ParamsV1 {
-		return fail(ReasonConfigInvalid, "unsupported params version %q", p.Version)
+	if !supportedVersions[p.Version] {
+		return fail(ReasonUnsupportedVer, "unsupported params version %q", p.Version)
 	}
 	if p.N < 16 {
 		return fail(ReasonConfigInvalid, "n=%d too small (minimum 16)", p.N)

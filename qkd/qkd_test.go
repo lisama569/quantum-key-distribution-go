@@ -388,8 +388,11 @@ func TestInvalidParamsRejected(t *testing.T) {
 
 // TestThresholdBoundary 验证阈值判定的严格性与噪声/窃听归类：
 // 同一主种子下，略低于阈值成功、略高于阈值中止，且无窃听时归为信道质量。
+//
+// 该用例钉住 V1 参数（threshold=0.15）与种子 1 下的具体 QBER 数值，
+// 是“老版本行为不回归、老记录重放逐比特一致”保障的一部分。
 func TestThresholdBoundary(t *testing.T) {
-	p := DefaultParams()
+	p := DefaultParamsV1()
 
 	// 低于阈值：成功（该种子/会话ID下 QBER≈0.1471）。
 	low := mustManager(t, 1, p, ChannelConfig{NoiseRate: 0.14})

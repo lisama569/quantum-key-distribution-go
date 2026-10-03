@@ -3,15 +3,24 @@ package qkd
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // ManagerConfig 为会话管理器配置。
 type ManagerConfig struct {
 	Params     Params        // 会话参数（版本化）
 	Channel    ChannelConfig // 信道模型配置（同时写入 Params 以便归档自洽）
-	Store      *KeyStore     // 密钥库（nil 时内部新建）
+	Store      *KeyStore     // 密钥库（nil 时按 StoreCapacity/Clock 内部新建）
 	History    *History      // 会话归档（nil 时内部新建）
 	MasterSeed int64         // 主种子：按会话标识域隔离派生子随机源
+	// StoreCapacity 为内部新建密钥库的条数上限（<=0 不限制）；
+	// 显式提供 Store 时本字段被忽略。
+	StoreCapacity int
+	// KeyTTL 为新签发密钥的有效期；<=0 表示不过期（只能显式退役/撤销/销毁）。
+	KeyTTL time.Duration
+	// Clock 为管理器与内部新建密钥库使用的时钟；nil 时用 time.Now。
+	// 注入可控时钟便于测试到期与容量回收行为。
+	Clock func() time.Time
 }
 
 // Manager 管理多个并发会话与密钥入库，保证会话间密钥材料零共享。
@@ -29,8 +38,11 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		return nil, err
 	}
 	cfg.Params = p
+	if cfg.Clock == nil {
+		cfg.Clock = time.Now
+	}
 	if cfg.Store == nil {
-		cfg.Store = NewKeyStore()
+		cfg.Store = NewKeyStoreWith(KeyStoreConfig{Capacity: cfg.StoreCapacity, Clock: cfg.Clock})
 	}
 	if cfg.History == nil {
 		cfg.History = NewHistory()
@@ -64,6 +76,10 @@ func (m *Manager) RunSession(ctx context.Context, sessionID string) (string, err
 		Rand:   NewSeededRand(seed),
 	})
 	if err != nil {
+		failReason := FailureReason(ReasonConfigInvalid)
+		if pe, ok := err.(*ProtocolError); ok {
+			failReason = pe.Reason
+		}
 		m.cfg.History.Add(SessionRecord{
 			Schema:     RecordV1,
 			ID:         sessionID,
@@ -72,7 +88,7 @@ func (m *Manager) RunSession(ctx context.Context, sessionID string) (string, err
 			Seed:       seed,
 			Channel:    m.cfg.Channel,
 			Success:    false,
-			FailReason: ReasonConfigInvalid,
+			FailReason: failReason,
 		})
 		return "", err
 	}
@@ -97,16 +113,25 @@ func (m *Manager) RunSession(ctx context.Context, sessionID string) (string, err
 		return "", runErr
 	}
 	keyID := KeyID(sessionID, m.cfg.Params.Version, seed)
-	if putErr := m.cfg.Store.Put(StoredKey{
+	stored := StoredKey{
 		ID:        keyID,
 		Key:       key,
 		State:     KeyActive,
 		ParamsVer: m.cfg.Params.Version,
-	}); putErr != nil {
-		// 入库失败（如 ID 冲突）不允许密钥游离在外。
+	}
+	if m.cfg.KeyTTL > 0 {
+		stored.ExpiresAt = m.cfg.Clock().Add(m.cfg.KeyTTL)
+	}
+	if putErr := m.cfg.Store.Put(stored); putErr != nil {
+		// 入库失败（容量满无法回收 / ID 冲突等）不允许密钥游离在外。
+		// 保留库给出的可区分原因（keystore_full / session_reused 等）。
 		wipe(key)
 		rec.Success = false
-		rec.FailReason = ReasonSessionReused
+		if pe, ok := putErr.(*ProtocolError); ok {
+			rec.FailReason = pe.Reason
+		} else {
+			rec.FailReason = ReasonSessionAborted
+		}
 		m.cfg.History.Add(rec)
 		return "", putErr
 	}

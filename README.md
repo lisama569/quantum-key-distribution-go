@@ -34,22 +34,38 @@
 
 ---
 
-## 2. 参数含义（版本化配置 `Params`）
+## 2. 参数含义与版本升级（版本化配置 `Params`）
 
-参数带版本号 `ParamsVersion`（当前为 `qkd-params-v1`），随会话一起归档；
+参数带版本号 `ParamsVersion`，随会话一起归档；
 **相同参数版本 + 相同主种子 + 相同信道配置 → 结果逐比特可复现**。
 
-| 字段 | 含义 | 默认值 | 约束 |
-|------|------|--------|------|
-| `Version` | 参数版本 | `qkd-params-v1` | 必须受支持 |
-| `N` | Alice 发送的量子比特数 | `2048` | ≥ 16 |
-| `SampleFraction` | QBER 抽样比例 | `0.2` | (0,1) |
-| `QBERThreshold` | 可接受误码率上限 | `0.15` | (0,1)，观测 QBER **严格大于**即中止 |
-| `NoiseRate` | 信道固有噪声翻转概率 | `0.03` | [0,1] |
-| `EavesdropRate` | Eve 拦截-重发比例 | `0.0` | [0,1] |
-| `KeyBytes` | 最终密钥长度（字节） | `32` | > 0（必填，0 直接判错而非取默认） |
-| `ReconcilePasses` | 纠错最大轮数 | `16` | > 0 |
-| `BlockSize` | 纠错分块大小 | `32` | > 1 |
+| 版本 | 状态 | 默认参数（N / 抽样比例 / 阈值 / 纠错轮数） |
+|------|------|--------------------------------------------|
+| `qkd-params-v1` | **继续支持**（老记录、老密钥行为冻结） | 2048 / 0.20 / 0.15 / 16 |
+| `qkd-params-v2` | **新会话默认版本** | 4096 / 0.25 / 0.12 / 24 |
+
+- `DefaultParams()` 返回当前默认（**V2**）；需要钉住旧行为时显式使用
+  `DefaultParamsV1()`。两版 `KeyBytes` 默认均为 32、`BlockSize` 均为 32。
+- **平滑升级、向后兼容**：
+  - 老的 V1 会话记录仍可解析，`ReplayRecord` 按记录重放得到与当初
+    **逐比特一致**的密钥、KeyID 与统计/失败结论（V1 的保密放大域标签
+    保持原始字节不变）；
+  - V1 签发并入库的密钥在 V2 管理器下**照常取用**，版本标记保留、字节不变；
+  - 传入不认识的版本（如 `qkd-params-v999`）一律返回
+    `unsupported_version`，与 `config_invalid` 等其它失败**明确可区分**；
+  - V2 使用独立的保密放大域标签 `qkd-pa-v2`，新旧版本密钥互不串用。
+
+| 字段 | 含义 | V1 默认 | V2 默认 | 约束 |
+|------|------|---------|---------|------|
+| `Version` | 参数版本 | `qkd-params-v1` | `qkd-params-v2` | 必须受支持，否则 `unsupported_version` |
+| `N` | Alice 发送的量子比特数 | `2048` | `4096` | ≥ 16 |
+| `SampleFraction` | QBER 抽样比例 | `0.2` | `0.25` | (0,1) |
+| `QBERThreshold` | 可接受误码率上限 | `0.15` | `0.12` | (0,1)，观测 QBER **严格大于**即中止 |
+| `NoiseRate` | 信道固有噪声翻转概率 | `0.03` | `0.02` | [0,1] |
+| `EavesdropRate` | Eve 拦截-重发比例 | `0.0` | `0.0` | [0,1] |
+| `KeyBytes` | 最终密钥长度（字节） | `32` | `32` | > 0（必填，0 直接判错而非取默认） |
+| `ReconcilePasses` | 纠错最大轮数 | `16` | `24` | > 0 |
+| `BlockSize` | 纠错分块大小 | `32` | `32` | > 1 |
 
 ### 版本化与可复现
 
@@ -67,13 +83,20 @@
 
 | FailureReason | 触发条件 | 是否产出密钥 |
 |---------------|----------|--------------|
-| `config_invalid` | 参数版本不受支持或取值非法 | 否 |
+| `config_invalid` | 参数取值非法（阈值范围、批量过小、空密钥、已过期入库等） | 否 |
+| `unsupported_version` | 参数版本不被认识（含重放未知版本记录），与 `config_invalid` 可区分 | 否 |
 | `session_reused` | 同一 `Session` 重复 `Run`，或密钥 ID 冲突 | 否 |
 | `insufficient_bits` | 筛选后位 < 16、无抽样位，或抽样后不足以构成 `KeyBytes*8` 位 | 否 |
 | `reconcile_failed` | 达到纠错轮数上限双方仍不一致（终验哈希不等） | 否 |
 | `channel_quality_exceeded` | QBER 超阈，且信道诊断**无**窃听拦截事件（判定为固有噪声过差） | 否 |
 | `eavesdropping_suspected` | QBER 超阈，且信道诊断**存在** Eve 拦截事件 | 否 |
-| `session_aborted` | 上下文取消等其它中止，以及密钥已撤销/销毁/不存在等库操作 | 否 |
+| `keystore_full` | 容量已满且没有任何可回收（已失效/退役）密钥，本次签发被拒 | 否 |
+| `key_not_found` | 取用/操作一个库中不存在（或已被回收删除）的密钥 | 否 |
+| `key_expired` | 密钥超过有效期（`Get` 惰性物化） | 否 |
+| `key_retired` | 密钥已被显式提前退役 | 否 |
+| `key_revoked` | 密钥已被撤销 | 否 |
+| `key_destroyed` | 密钥已被销毁（终态） | 否 |
+| `session_aborted` | 上下文取消等其它中止 | 否 |
 
 ### 噪声 vs 窃听如何区分
 
@@ -100,15 +123,50 @@ BB84 中窃听者（拦截-重发）和噪声都会抬高 QBER。本组件的判
 - 任一会话失败：只归档失败记录，**不写入密钥**；不取消其它会话，也不改动密钥库
   既有内容。`KeyStore` 与 `History` 均为线程安全（互斥 / 读写锁），已通过
   `go test -race` 验证。
+- 容量回收、显式退役/撤销与多个会话并发发生时同样安全：回收判定与入库在同一把
+  互斥锁内原子完成，同一会话不会重复产出密钥，任一会话失败（含库满）不影响其它
+  会话与库内已有密钥。
 
-### 密钥生命周期（`KeyStore`）
+### 容量上限与回收策略（长期运行不膨胀）
+
+- `NewKeyStoreWith(KeyStoreConfig{Capacity: n, Clock: clk})` 按**条数**设置上限；
+  `Capacity <= 0` 表示不限制。`ManagerConfig.StoreCapacity` 可在管理器层配置。
+- 库已满又要签发新密钥时，**只回收已不可取用的密钥**，按确定性优先级腾位：
+  `destroyed → expired → retired → revoked`，同级按“最早到期 → 最早入库 → ID”
+  排序。**有效期内的 `active` 密钥永远不会被回收或覆盖。**
+- 若库里全是有效密钥、腾不出空间，本次签发**明确失败**为 `keystore_full`，
+  库内容一字节不变，失败仅写入会话归档（不会悄悄挤掉老密钥）。
+- 每一次回收都追加一条 `ReclamationRecord` 审计（回收了谁、当时状态、
+  回收原因、回收时间、为哪条新密钥腾位），可经 `KeyStore.Reclamations()` 查询。
+
+### 密钥生命周期（`KeyStore`，五态）
+
+```
+                 TTL 到期(惰性)
+   active ───────────────────────▶ expired
+     │  Retire         ▲ 过期即物化，时钟回退也不复活
+     ├──────────────▶ retired
+     │  Revoke        │  （退役/过期可升级为撤销）
+     ├──────────────▶ revoked
+     │  Destroy       ▼
+     └──────────────▶ destroyed（终态：撤销/退役/过期均被拒绝，不可复活）
+```
 
 | 操作 | 行为 |
 |------|------|
-| `Get(id)` | 仅 `active` 可取回（返回字节**副本**）；不存在 / 已撤销 / 已销毁均报错，不返回字节 |
-| `Revoke(id)` | 置为 `revoked` 并清零字节；幂等；对已销毁密钥调用报错 |
-| `Destroy(id)` | 置为终态 `destroyed` 并清零字节，不可逆 |
-| `State(id)` / `IDs()` | 状态查询 / 盘点 |
+| `Get(id)` | 仅“未过期的 `active`”可取回（返回字节**副本**）；不存在 / 已过期 / 已退役 / 已撤销 / 已销毁分别返回 **5 个互不相同**的原因，不返回字节 |
+| `Retire(id)` | 显式提前退役并清零字节；记录留存可审计、可被容量回收；幂等；对已撤销/销毁/过期密钥报错 |
+| `Revoke(id)` | 置为 `revoked` 并清零字节；幂等；可从 active/retired 转入；对已销毁/已过期报错 |
+| `Destroy(id)` | 置为终态 `destroyed` 并清零字节；幂等；**此后回收/版本升级都不可能让它恢复可用** |
+| `State(id)` / `IDs()` / `Snapshot()` | 状态查询（会惰性物化过期）/ ID 盘点 / 元数据快照（不带密钥字节） |
+| `Reclamations()` / `ReclaimableCount()` / `Len()` / `Cap()` | 回收审计与容量盘点 |
+
+- 有效期由 `ManagerConfig.KeyTTL`（`time.Duration`）配置，`<=0` 表示不过期；
+  也可在 `StoredKey.ExpiresAt` 上直接给出绝对截止时刻。时钟经
+  `KeyStoreConfig.Clock` / `ManagerConfig.Clock` 注入（默认 `time.Now`），
+  便于用固定时钟验证到期行为。
+- 过期判定为 **`ExpiresAt <= now`**（到期时刻即不可用），在 `Get/State/Snapshot`
+  及容量回收时惰性物化。
 
 密钥 ID 由 `SHA256("qkd-keyid" ‖ sessionID ‖ paramsVersion ‖ seed)` 确定性派生，
 重放一致且不同会话不撞 ID。
@@ -123,6 +181,10 @@ BB84 中窃听者（拦截-重发）和噪声都会抬高 QBER。本组件的判
   - 缺失 `schema` 时归一为 `qkd-record-v1`；
   - 接受旧字段别名 `params_version`、`abort_reason`；
   - 忽略未知字段，保证“历史会话记录在新版本下仍可解析”。
+- `ReplayRecord(ctx, record)` 仅凭归档记录（参数版本/参数/种子/信道）重建并重放
+  会话，**不读写任何 KeyStore/History**，可并发安全调用。老的 V1 记录在 V2
+  成为默认后重放，仍得到与当初**逐比特一致**的密钥、KeyID、统计与失败原因；
+  记录版本未知时返回 `unsupported_version`。
 
 ---
 
@@ -130,11 +192,15 @@ BB84 中窃听者（拦截-重发）和噪声都会抬高 QBER。本组件的判
 
 ```go
 mgr, _ := qkd.NewManager(qkd.ManagerConfig{
-    Params:     qkd.DefaultParams(),                    // qkd-params-v1
-    Channel:    qkd.ChannelConfig{NoiseRate: 0.03},     // 干净信道
-    Store:      qkd.NewKeyStore(),                      // 可省略，内部新建
-    History:    qkd.NewHistory(),                       // 可省略
-    MasterSeed: 42,
+    Params:        qkd.DefaultParams(),                 // 默认 qkd-params-v2
+    Channel:       qkd.ChannelConfig{NoiseRate: 0.02},  // 干净信道
+    Store:         qkd.NewKeyStoreWith(qkd.KeyStoreConfig{
+        Capacity: 1024,                                 // 按条计数的容量上限
+        // Clock: clk,                                  // 可选：注入可控时钟
+    }),
+    History:       qkd.NewHistory(),                    // 可省略，内部新建
+    MasterSeed:    42,
+    KeyTTL:        24 * time.Hour,                      // 新密钥有效期（<=0 不过期）
 })
 
 keyID, err := mgr.RunSession(context.Background(), "session-001")
@@ -142,15 +208,40 @@ if err != nil {
     var pe *qkd.ProtocolError
     errors.As(err, &pe)
     switch pe.Reason {
-    case qkd.ReasonEavesdropping:   // 疑似窃听
-    case qkd.ReasonChannelQuality:  // 噪声过差
-    default:                        // 其它失败
+    case qkd.ReasonEavesdropping:  // 疑似窃听
+    case qkd.ReasonChannelQuality: // 噪声过差
+    case qkd.ReasonStoreFull:      // 库满且没有可回收的失效密钥
+    case qkd.ReasonUnsupportedVer: // 参数版本不认识
+    default:                       // 其它失败
     }
 }
 
-key, _ := mgr.Store().Get(keyID)     // 32 字节
-mgr.Store().Revoke(keyID)            // 撤销后不可再 Get
-mgr.Store().Destroy(keyID)           // 销毁（终态）
+key, err := mgr.Store().Get(keyID) // 未过期 active：可取回
+if err != nil {
+    switch {
+    case qkd.IsFailure(err, qkd.ReasonKeyNotFound):  // 根本不存在/已被回收
+    case qkd.IsFailure(err, qkd.ReasonKeyExpired):   // 已过期
+    case qkd.IsFailure(err, qkd.ReasonKeyRetired):   // 已退役
+    case qkd.IsFailure(err, qkd.ReasonKeyRevoked):   // 已撤销
+    case qkd.IsFailure(err, qkd.ReasonKeyDestroyed): // 已销毁
+    }
+}
+mgr.Store().Retire(keyID)           // 显式提前退役（记录留存，可被回收）
+mgr.Store().Revoke(keyID)           // 撤销
+mgr.Store().Destroy(keyID)          // 销毁（终态）
+for _, rc := range mgr.Store().Reclamations() {
+    log.Printf("reclaimed %s because %s at %s for %s",
+        rc.KeyID, rc.Cause, rc.ReclaimedAt, rc.ReplacedByID) // 回收审计
+}
+```
+
+钉住 V1 行为 / 升级后校验老记录重放：
+
+```go
+v1 := qkd.DefaultParamsV1()                         // 老版本继续支持
+rec, _ := qkd.UnmarshalRecord(archivedJSON)         // 老记录仍可解析
+res, err := qkd.ReplayRecord(ctx, rec)              // 不触碰库，纯重放
+// res.Key 与当初逐比特一致；未知版本 -> unsupported_version
 ```
 
 并发：
@@ -176,11 +267,11 @@ go test -race ./...     # 竞态检测（并发隔离）
 go test -v ./...        # 查看每个用例打印的“输入参数/判定依据/结论”
 ```
 
-测试覆盖：
+测试覆盖（原有用例全部保留并保持通过，新增用例标记 🆕）：
 
 - `TestSuccessfulNegotiation`：正常协商，得到长度确定且可取回的密钥；
 - `TestRepeatability`：相同种子/参数/信道重放，密钥与统计逐比特一致；
-- `TestThresholdBoundary`：阈值上下严格判定（0.1471 成功 vs 0.1644 中止）；
+- `TestThresholdBoundary`：V1 阈值上下严格判定（钉住旧版本行为不回归）；
 - `TestAbortEavesdropping`：高窃听率中止且归类 `eavesdropping_suspected`，无密钥残留；
 - `TestAbortChannelNoise`：纯噪声超阈中止且归类 `channel_quality_exceeded`，与窃听可区分；
 - `TestSessionCannotProduceTwice`：同一会话不得重复产出密钥；
@@ -189,4 +280,24 @@ go test -v ./...        # 查看每个用例打印的“输入参数/判定依�
 - `TestKeyRevokeAndDestroy`：撤销/销毁后密钥不可再取出，销毁为不可逆终态；
 - `TestFailedSessionNoHalfKey`：中途失败不留半成品密钥；
 - `TestInvalidParamsRejected`：非法参数归类 `config_invalid`；
-- `TestRecordBackwardCompatibility` / `TestRecordRoundTrip`：历史记录兼容解析与往返。
+- `TestRecordBackwardCompatibility` / `TestRecordRoundTrip`：历史记录兼容解析与往返；
+- 🆕 `TestCapacityEvictsOnlyInvalidKeys`：满库只回收失效密钥、全有效时 `keystore_full`
+  明确失败、回收审计（谁/为什么/何时/为谁腾位）可查；
+- 🆕 `TestCapacityEvictionPriority`：回收优先级 destroyed→expired→retired→revoked；
+- 🆕 `TestCapacityManagerFullFailsSession`：管理器端到端库满失败且既有密钥不动；
+- 🆕 `TestKeyExpiry`：TTL 到期不可取用、状态物化、时钟回退不复活；
+- 🆕 `TestKeyRetireLifecycle`：显式退役不可取用但留存可审计、可回收、终态不可退役；
+- 🆕 `TestGetFailureReasonsDistinct`：不存在/过期/退役/撤销/销毁五种取用失败互不相同；
+- 🆕 `TestTerminalStatesNeverRevive`：撤销/销毁密钥不会因回收或升级复活；
+- 🆕 `TestManagerTTL`：管理器签发的密钥带有效期且到期不可取用；
+- 🆕 `TestV1RecordReplayBitIdentical` / `TestV1FailedRecordReplay`：老 V1 记录在
+  V2 默认下重放，成功密钥/失败原因/统计逐比特一致；
+- 🆕 `TestDefaultIsV2AndV2Negotiates`：默认版本为 V2 且协商正常；
+- 🆕 `TestV1KeyUsableUnderV2Manager`：V1 老密钥在 V2 管理器下照常取用、字节不变；
+- 🆕 `TestUnknownVersionRejectedDistinctly`：未知版本归类 `unsupported_version`
+  （管理器构造与记录重放两条路径均可区分）；
+- 🆕 `TestConcurrentSessionsWithReclamation`：并发协商与过期回收/退役同时发生，
+  会话不串扰、结论确定、失败不影响其它会话与库内密钥。
+
+每个用例通过 `t.Logf` 打印 `[输入参数] → [判定依据] → [结论]`，用
+`go test -v` 可看到每个场景的输入、判定依据与结论；`go test -race` 覆盖并发路径。

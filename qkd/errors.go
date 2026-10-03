@@ -11,12 +11,21 @@ type FailureReason string
 const (
 	ReasonNone             FailureReason = ""
 	ReasonConfigInvalid    FailureReason = "config_invalid"
+	ReasonUnsupportedVer   FailureReason = "unsupported_version"
 	ReasonSessionReused    FailureReason = "session_reused"
 	ReasonSessionAborted   FailureReason = "session_aborted"
 	ReasonInsufficientBits FailureReason = "insufficient_bits"
 	ReasonReconcileFailed  FailureReason = "reconcile_failed"
 	ReasonEavesdropping    FailureReason = "eavesdropping_suspected"
 	ReasonChannelQuality   FailureReason = "channel_quality_exceeded"
+	// 以下为密钥库/密钥生命周期专属原因，调用方必须能互相区分：
+	// 不存在、已过期、已退役、已撤销、已销毁，以及容量已满且无可回收密钥。
+	ReasonKeyNotFound  FailureReason = "key_not_found"
+	ReasonKeyExpired   FailureReason = "key_expired"
+	ReasonKeyRetired   FailureReason = "key_retired"
+	ReasonKeyRevoked   FailureReason = "key_revoked"
+	ReasonKeyDestroyed FailureReason = "key_destroyed"
+	ReasonStoreFull    FailureReason = "keystore_full"
 )
 
 // ProtocolError 是本包返回的统一错误类型，携带可机器判别的失败原因。
