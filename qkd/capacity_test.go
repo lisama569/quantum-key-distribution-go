@@ -2,15 +2,29 @@ package qkd
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
 
-// fakeClock 是测试用可控时钟。
-type fakeClock struct{ t time.Time }
+// fakeClock 是测试用可控时钟；advance 可能与后台会话的 now 并发发生，
+// 故内部加锁保证线程安全（go test -race 下同样安全）。
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
 
-func (c *fakeClock) now() time.Time          { return c.t }
-func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
 
 // putKey 是测试辅助：直接向库存入一条 active 密钥。
 func putKey(t *testing.T, s *KeyStore, id string, ver ParamsVersion, exp time.Time) {

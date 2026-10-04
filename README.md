@@ -29,8 +29,18 @@
   纠错后比特，保密放大输出**长度确定**的密钥。
 - 一个 `Session` 对象**至多产出一把密钥**：再次调用 `Run` 返回
   `session_reused` 错误；失败后重跑同样被拒绝。
-- 失败路径（中止、取消、纠错失败、材料不足）会 wipe 掉量子比特、各阶段比特串等
-  全部中间材料，密钥库不会写入半成品。
+- **管理器层面的会话签发幂等（与密钥当前状态无关）**：同一个会话 ID 只要
+  成功产出过一次，就被永久登记在 `History` 的只追加“签发登记表”中。此后无论
+  这把密钥被**容量回收清除、退役、撤销、销毁还是到期清除**，也无论管理器参数
+  是否升级到新版本（新版本会派生出不同的 KeyID），对同一会话再次
+  `RunSession` 都一律返回 `session_reused`，**绝不会产出第二把密钥**。
+  该判定以会话归档为单一事实来源，而**不是**“密钥库里现在还有没有这条记录”。
+  仅失败过（从未成功）的会话允许重试；一旦某次重试成功，之后同样不可再签发。
+- 同一会话 ID 的**并发调用严格串行**（不同会话仍真正并发）：先到者成功，
+  其余并发提交全部得到 `session_reused`，因此同一会话在并发下也恰好签发一次。
+- 失败路径（中止、取消、纠错失败、材料不足、库满）会 wipe 掉量子比特、各阶段
+  比特串等全部中间材料，密钥库不会写入半成品；若入库成功后签发登记发现该会话
+  已在别处成功登记（共享归档的跨管理器竞态），刚写入的密钥会被立即回滚删除。
 
 ---
 
@@ -85,7 +95,7 @@
 |---------------|----------|--------------|
 | `config_invalid` | 参数取值非法（阈值范围、批量过小、空密钥、已过期入库等） | 否 |
 | `unsupported_version` | 参数版本不被认识（含重放未知版本记录），与 `config_invalid` 可区分 | 否 |
-| `session_reused` | 同一 `Session` 重复 `Run`，或密钥 ID 冲突 | 否 |
+| `session_reused` | 同一 `Session` 重复 `Run`；密钥 ID 冲突；或同一会话 ID 已经成功签发过（即使其密钥已被回收/退役/撤销/销毁/过期，或参数版本已升级）；同一会话的并发重复提交 | 否 |
 | `insufficient_bits` | 筛选后位 < 16、无抽样位，或抽样后不足以构成 `KeyBytes*8` 位 | 否 |
 | `reconcile_failed` | 达到纠错轮数上限双方仍不一致（终验哈希不等） | 否 |
 | `channel_quality_exceeded` | QBER 超阈，且信道诊断**无**窃听拦截事件（判定为固有噪声过差） | 否 |
@@ -120,12 +130,14 @@ BB84 中窃听者（拦截-重发）和噪声都会抬高 QBER。本组件的判
 
 - `Manager.RunSessions(ctx, ids)` 为每个会话启动独立 goroutine，使用各自独立的
   `Session` 与派生随机源；**会话之间不共享任何密钥材料**，密钥两两不同。
+- **同一会话 ID 串行、不同会话并行**：管理器为每个会话 ID 配独立互斥锁，
+  并发重复提交同一 ID 时恰好一次成功、其余返回 `session_reused`。
 - 任一会话失败：只归档失败记录，**不写入密钥**；不取消其它会话，也不改动密钥库
   既有内容。`KeyStore` 与 `History` 均为线程安全（互斥 / 读写锁），已通过
-  `go test -race` 验证。
+  `go test -race` 压测验证。
 - 容量回收、显式退役/撤销与多个会话并发发生时同样安全：回收判定与入库在同一把
-  互斥锁内原子完成，同一会话不会重复产出密钥，任一会话失败（含库满）不影响其它
-  会话与库内已有密钥。
+  互斥锁内原子完成，会话之间互不影响、既有有效密钥绝不丢失；同一会话不会重复
+  产出密钥，任一会话失败（含库满）不影响其它会话与库内已有密钥。
 
 ### 容量上限与回收策略（长期运行不膨胀）
 
@@ -168,6 +180,14 @@ BB84 中窃听者（拦截-重发）和噪声都会抬高 QBER。本组件的判
 - 过期判定为 **`ExpiresAt <= now`**（到期时刻即不可用），在 `Get/State/Snapshot`
   及容量回收时惰性物化。
 
+> **一旦不可用，永不复活。** `expired / retired / revoked / destroyed` 的密钥
+> 被容量回收删除后只是“记录不存在”（`Get` 返回 `key_not_found`），任何后续操作
+> ——包括再次入库、管理器参数版本升级——都不可能让同一把密钥或同一会话重新
+> 得到可正常取用的 active 密钥：库侧非 active 记录字节已清零且状态只向更终态
+> 迁移，管理器侧则由会话签发幂等（见第 1 节）阻止同一会话二次产出。取用失败时
+> `key_not_found / key_expired / key_retired / key_revoked / key_destroyed`
+> 五种原因彼此可区分。
+
 密钥 ID 由 `SHA256("qkd-keyid" ‖ sessionID ‖ paramsVersion ‖ seed)` 确定性派生，
 重放一致且不同会话不撞 ID。
 
@@ -177,6 +197,10 @@ BB84 中窃听者（拦截-重发）和噪声都会抬高 QBER。本组件的判
 
 - `SessionRecord` 是一次会话（成功或失败）的完整可复现归档：记录格式版本
   `RecordSchemaVersion`（`qkd-record-v1`）与协议参数版本正交保存。
+- 除普通归档外，`History` 还维护一份**只追加的“已成功签发登记表”**
+  （`MarkIssued` / `IsIssued`）：任一会话 ID 成功一次即永久登记，是管理器
+  会话签发幂等的单一事实来源。成功记录不会被后来的失败归档或重复成功覆盖；
+  仅失败过的会话之后首次成功仍可登记。
 - `MarshalRecord` / `UnmarshalRecord` 提供 JSON 序列化。解析器**向后兼容**：
   - 缺失 `schema` 时归一为 `qkd-record-v1`；
   - 接受旧字段别名 `params_version`、`abort_reason`；
@@ -211,6 +235,7 @@ if err != nil {
     case qkd.ReasonEavesdropping:  // 疑似窃听
     case qkd.ReasonChannelQuality: // 噪声过差
     case qkd.ReasonStoreFull:      // 库满且没有可回收的失效密钥
+    case qkd.ReasonSessionReused:  // 该会话已成功签发过（与密钥当前状态无关）
     case qkd.ReasonUnsupportedVer: // 参数版本不认识
     default:                       // 其它失败
     }
@@ -264,6 +289,7 @@ go build ./...          # 编译
 go vet ./...            # 静态检查
 go test ./...           # 全部单测
 go test -race ./...     # 竞态检测（并发隔离）
+go test -race -count=10 ./...  # 重复多轮竞态压测，专门验证并发回收/重复签发
 go test -v ./...        # 查看每个用例打印的“输入参数/判定依据/结论”
 ```
 
@@ -298,6 +324,20 @@ go test -v ./...        # 查看每个用例打印的“输入参数/判定依�
   （管理器构造与记录重放两条路径均可区分）；
 - 🆕 `TestConcurrentSessionsWithReclamation`：并发协商与过期回收/退役同时发生，
   会话不串扰、结论确定、失败不影响其它会话与库内密钥。
+- 🆕 `TestReissueAfterKeyReclaimed`：同一会话的密钥分别被撤销/销毁/退役/过期后
+  再经容量回收清除，重跑同一会话一律 `session_reused`，不产出第二把密钥；
+- 🆕 `TestReissueRefusedAcrossVersionUpgrade`：参数 V1→V2 升级后（新旧 KeyID
+  不同），无论旧密钥仍在库还是已被回收，同一会话重跑都被拒绝；
+- 🆕 `TestUnusableKeysNeverReviveManagerLevel`：撤销/销毁/过期密钥经容量回收与
+  版本升级后都不会复活为可取用密钥；
+- 🆕 `TestFailedSessionRetryThenIdempotent`：仅失败过的会话可重试，成功之后不可
+  再签发；
+- 🆕 `TestConcurrentSameSessionSingleIssuance`：同一会话 16 个并发提交恰好一次
+  成功、其余全部 `session_reused`，库内仅一把密钥；
+- 🆕 `TestConcurrentMixedSessionsWithReclamation`：不同会话并发、同会话重复提交
+  与回收/盘点交织时，会话互不影响、同会话只签发一次、active 密钥绝不被回收；
+- 🆕 `TestHistoryIssuedRegistryAppendOnly`：签发登记表只追加，失败记录不能覆盖
+  成功结论。
 
 每个用例通过 `t.Logf` 打印 `[输入参数] → [判定依据] → [结论]`，用
 `go test -v` 可看到每个场景的输入、判定依据与结论；`go test -race` 覆盖并发路径。

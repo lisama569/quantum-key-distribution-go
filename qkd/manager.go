@@ -26,6 +26,12 @@ type ManagerConfig struct {
 // Manager 管理多个并发会话与密钥入库，保证会话间密钥材料零共享。
 type Manager struct {
 	cfg ManagerConfig
+
+	// sessionLocks 为每个会话 ID 配一把互斥锁：不同会话可真正并发，
+	// 同一会话 ID 的多次调用（含并发重复提交）严格串行，杜绝并发重复签发。
+	// 条数以“不同会话 ID 总数”为上界，本地长期运行可接受，故不做删除。
+	sessionMu    sync.Mutex
+	sessionLocks map[string]*sync.Mutex
 }
 
 // NewManager 构造管理器（填充默认值并校验参数）。
@@ -47,7 +53,20 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.History == nil {
 		cfg.History = NewHistory()
 	}
-	return &Manager{cfg: cfg}, nil
+	return &Manager{cfg: cfg, sessionLocks: map[string]*sync.Mutex{}}, nil
+}
+
+// lockSession 取该会话专属锁并加锁：同 ID 串行、异 ID 并发。
+func (m *Manager) lockSession(sessionID string) *sync.Mutex {
+	m.sessionMu.Lock()
+	l, ok := m.sessionLocks[sessionID]
+	if !ok {
+		l = &sync.Mutex{}
+		m.sessionLocks[sessionID] = l
+	}
+	m.sessionMu.Unlock()
+	l.Lock()
+	return l
 }
 
 // Store 返回管理器使用的密钥库。
@@ -68,7 +87,25 @@ func (m *Manager) sessionSeed(sessionID string) int64 {
 
 // RunSession 执行单个会话；成功则把密钥入库并归档，失败仅归档失败记录，
 // 绝不写入任何半成品密钥。
+//
+// 会话级幂等：同一个 sessionID 只要曾经成功签发过一次，之后无论其密钥
+// 处于 active、被容量回收、退役、撤销、销毁还是过期清除，也无论管理器参数
+// 是否升级到新版本，再次调用都立即返回 session_reused，绝不会产出第二把
+// 密钥。判定依据是 History 中只追加的签发登记表，而非密钥库现存内容。
+// 同一会话的并发调用严格串行：先到者若成功，后到者一律得到 session_reused。
+// 此前仅失败过的会话允许重试。
 func (m *Manager) RunSession(ctx context.Context, sessionID string) (string, error) {
+	// 同一会话串行化，保证“查签发登记→协商→入库→登记”对同一 ID 不会交错。
+	sessionLock := m.lockSession(sessionID)
+	defer sessionLock.Unlock()
+
+	if prior, issued := m.cfg.History.IsIssued(sessionID); issued {
+		err := fail(ReasonSessionReused,
+			"session %q has already produced key %q under params %s; a session can only issue once (key state does not matter)",
+			sessionID, prior.KeyID, prior.ParamsVer)
+		return "", err
+	}
+
 	seed := m.sessionSeed(sessionID)
 	sess, err := NewSession(SessionConfig{
 		ID:     sessionID,
@@ -135,11 +172,21 @@ func (m *Manager) RunSession(ctx context.Context, sessionID string) (string, err
 		m.cfg.History.Add(rec)
 		return "", putErr
 	}
-	wipe(key) // 入库持有独立副本，清掉本地这份。
+	// 先入库、后登记：登记只追加且不可覆盖。若共享归档已被别处登记过该会话
+	// （极端的跨管理器竞态），必须回滚刚刚写入的密钥，绝不留下第二把。
 	rec.Success = true
 	rec.KeyID = keyID
 	rec.KeyBytes = len(key)
-	m.cfg.History.Add(rec)
+	if !m.cfg.History.MarkIssued(rec) {
+		m.cfg.Store.removeForRollback(keyID)
+		wipe(key)
+		if prior, ok := m.cfg.History.IsIssued(sessionID); ok {
+			return "", fail(ReasonSessionReused,
+				"session %q had already produced key %q", sessionID, prior.KeyID)
+		}
+		return "", fail(ReasonSessionReused, "session %q had already produced a key", sessionID)
+	}
+	wipe(key) // 入库持有独立副本，清掉本地这份。
 	return keyID, nil
 }
 

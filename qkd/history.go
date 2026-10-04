@@ -33,19 +33,62 @@ type SessionRecord struct {
 }
 
 // History 保存历史会话记录，线程安全，支持按版本解析旧记录。
+//
+// 除普通归档外，History 还维护一份只追加的“已成功签发登记表” issued：
+// 任一会话 ID 一旦成功产出过密钥即永久登记，与该密钥之后是否被容量回收、
+// 退役、撤销、销毁或到期清除完全无关，也不受参数版本升级影响。管理器据此
+// 保证“同一会话至多签发一把密钥”。
 type History struct {
 	mu      sync.RWMutex
 	records map[string]SessionRecord
+	issued  map[string]SessionRecord
 }
 
 // NewHistory 构造空历史。
-func NewHistory() *History { return &History{records: map[string]SessionRecord{}} }
+func NewHistory() *History {
+	return &History{records: map[string]SessionRecord{}, issued: map[string]SessionRecord{}}
+}
 
 // Add 追加（或覆盖）一条会话记录。
+//
+// 已存在“成功签发”记录时，后续任何记录都不得覆盖它：失败归档不能抹掉
+// 一次既成的成功（成功结论与会话幂等保证永久成立）。失败记录之间可以覆盖，
+// 成功记录也可以覆盖此前的失败记录。
 func (h *History) Add(r SessionRecord) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if old, ok := h.issued[r.ID]; ok {
+		h.records[r.ID] = old
+		return
+	}
+	if r.Success {
+		h.issued[r.ID] = r
+	}
 	h.records[r.ID] = r
+}
+
+// MarkIssued 登记一次成功签发（只追加）：同时写入签发登记表与普通归档。
+// 若该会话此前已成功签发过，则什么都不做并返回 false——成功结论不可重复、
+// 不可覆盖。首次登记返回 true。
+func (h *History) MarkIssued(r SessionRecord) bool {
+	r.Success = true
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.issued[r.ID]; ok {
+		return false
+	}
+	h.issued[r.ID] = r
+	h.records[r.ID] = r
+	return true
+}
+
+// IsIssued 返回该会话是否曾经成功签发过密钥；一旦为 true 即永久为 true，
+// 与其密钥当前是 active、已回收、退役、撤销、销毁还是过期均无关。
+func (h *History) IsIssued(sessionID string) (SessionRecord, bool) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	r, ok := h.issued[sessionID]
+	return r, ok
 }
 
 // Get 按会话 ID 取记录。

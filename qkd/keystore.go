@@ -172,6 +172,20 @@ func (s *KeyStore) Put(k StoredKey) error {
 	return nil
 }
 
+// removeForRollback 仅供 Manager 在“密钥已入库、但会话签发登记失败
+// （该会话已在别处成功登记）”时回滚本次写入：删除的正是刚插入的那一条。
+// 它不是公开的删除/退役能力——正常生命周期只能走 Retire/Revoke/Destroy
+// 与容量回收；此处不追加回收审计，因为这条密钥从未成为一次有效签发。
+// 若记录已不存在（极端竞态）则什么都不做。
+func (s *KeyStore) removeForRollback(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if k, ok := s.keys[id]; ok {
+		wipe(k.Key)
+		delete(s.keys, id)
+	}
+}
+
 // Get 按 ID 取回“仍在有效期内的 Active 密钥”的副本；
 // 不存在 / 已过期 / 已退役 / 已撤销 / 已销毁各自返回互不相同的 FailureReason，
 // 且一律不返回任何字节。
