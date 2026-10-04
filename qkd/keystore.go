@@ -42,12 +42,27 @@ type StoredKey struct {
 // 容量上限见 KeyStoreConfig.Capacity：库满后 Put 只允许回收
 // “已过期 / 已退役 / 已撤销 / 已销毁”的密钥腾出空间，绝不覆盖仍可
 // 正常取用的 Active 密钥；无空间可回收时以 keystore_full 明确失败。
+//
+// 被回收删除的密钥不会“消失得无影无踪”：其不可用结论以墓碑形式永久留存
+// （tombstones，只记状态不记字节，不占容量）。因此回收/版本升级等任何
+// 腾挪都不可能让同一 ID 重新以 active 入库（Put 直接按原终态拒绝），
+// Get 也仍能区分它当初是 expired/retired/revoked/destroyed 中的哪一种。
 type KeyStore struct {
-	mu       sync.Mutex
-	keys     map[string]*StoredKey
-	capacity int
-	now      func() time.Time
-	reclog   []ReclamationRecord
+	mu         sync.Mutex
+	keys       map[string]*StoredKey
+	tombstones map[string]KeyState
+	sessions   map[string]sessionIssue
+	capacity   int
+	now        func() time.Time
+	reclog     []ReclamationRecord
+}
+
+// sessionIssue 记录“某个会话已成功签发过密钥”这一永久结论：
+// 只要会话成功过一次，无论其密钥后来被回收/退役/撤销/到期/销毁，
+// 该登记都保留，同一会话永远不可能再产出第二把密钥。
+type sessionIssue struct {
+	KeyID     string
+	ParamsVer ParamsVersion
 }
 
 // ReclamationCause 说明一条密钥被容量回收的直接原因。
@@ -104,9 +119,11 @@ func NewKeyStoreWith(cfg KeyStoreConfig) *KeyStore {
 		clock = time.Now
 	}
 	return &KeyStore{
-		keys:     map[string]*StoredKey{},
-		capacity: cfg.Capacity,
-		now:      clock,
+		keys:       map[string]*StoredKey{},
+		tombstones: map[string]KeyState{},
+		sessions:   map[string]sessionIssue{},
+		capacity:   cfg.Capacity,
+		now:        clock,
 	}
 }
 
@@ -114,10 +131,20 @@ func NewKeyStoreWith(cfg KeyStoreConfig) *KeyStore {
 func (s *KeyStore) Cap() int { return s.capacity }
 
 // Len 返回当前留存条数（含已过期/退役/撤销/销毁但尚未被回收的记录）。
+// 已回收的 ID 只留墓碑，不计入条数、不占容量。
 func (s *KeyStore) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.keys)
+}
+
+// Tombstone 查询一个已被回收删除的 ID 留下的不可用结论。
+// 第二个返回值为 false 表示该 ID 从未入库、或记录仍在库中（未被回收）。
+func (s *KeyStore) Tombstone(id string) (KeyState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.tombstones[id]
+	return st, ok
 }
 
 // Put 存入一条新密钥（ID 冲突时报错，已有内容不受影响）。
@@ -125,14 +152,24 @@ func (s *KeyStore) Len() int {
 // 若 ExpiresAt 已早于当前时间则拒绝（config_invalid）；State 为空时归一为
 // active；显式给出的非 active 态也接受（此时不留存字节）。
 func (s *KeyStore) Put(k StoredKey) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.putLocked(k)
+}
+
+// putLocked 为 Put 的持锁实现，供 Put 与 IssueSession 复用；调用方必须持有 s.mu。
+func (s *KeyStore) putLocked(k StoredKey) error {
 	if k.ID == "" {
 		return fail(ReasonConfigInvalid, "key id must not be empty")
 	}
 	if len(k.Key) == 0 {
 		return fail(ReasonConfigInvalid, "key material must not be empty")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// 已被回收删除的 ID 留有墓碑：该密钥此前已进入不可用状态，回收/腾挪/
+	// 版本升级都不允许它以任何状态（尤其 active）重新入库“复活”。
+	if st, buried := s.tombstones[k.ID]; buried {
+		return terminalFailure(st, k.ID, "cannot put key %q: it was previously reclaimed as %s and can never be usable again")
+	}
 	if _, exists := s.keys[k.ID]; exists {
 		return fail(ReasonSessionReused, "key id %q already exists", k.ID)
 	}
@@ -172,6 +209,61 @@ func (s *KeyStore) Put(k StoredKey) error {
 	return nil
 }
 
+// IssueSession 原子地完成“会话去重检查 + 密钥入库”，这是会话签发幂等性的
+// 唯一入口：
+//
+//   - 同一 sessionID 只要成功签发过一次，登记就永久保留。此后无论其密钥
+//     是被容量回收、退役、撤销、到期还是销毁，再以该会话签发都会以
+//     session_reused 明确失败（返回信息带当初的 KeyID），绝不产出第二把；
+//   - 去重检查、容量回收与入库在同一把互斥锁内完成，因此多个管理器/多
+//     goroutine 并发签发同一会话时，恰有一个成功，其余全部 session_reused，
+//     不会出现检查与入库之间的竞态窗口；
+//   - 首次签发若因库满（keystore_full）等失败，会话登记不会写入（本次
+//     未成功），库内容保持不变，也不留半成品。
+func (s *KeyStore) IssueSession(sessionID string, k StoredKey) error {
+	if sessionID == "" {
+		return fail(ReasonConfigInvalid, "session id must not be empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if prev, ok := s.sessions[sessionID]; ok {
+		return fail(ReasonSessionReused,
+			"session %q already issued key %q; a session can produce at most one key for its lifetime (even after reclamation/retirement/revocation/expiry/destruction)",
+			sessionID, prev.KeyID)
+	}
+	if err := s.putLocked(k); err != nil {
+		return err
+	}
+	// 入库成功后才落会话登记；二者同锁，对外表现为一次原子提交。
+	s.sessions[sessionID] = sessionIssue{KeyID: k.ID, ParamsVer: k.ParamsVer}
+	return nil
+}
+
+// IssuedSession 返回某会话此前成功签发的密钥 ID 与参数版本。
+// 第二个返回值为 false 表示该会话从未成功签发过（密钥可能入库失败、
+// 协商中止，或会话 ID 根本不存在）。该登记不会因密钥被回收而移除。
+func (s *KeyStore) IssuedSession(sessionID string) (keyID string, ver ParamsVersion, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev, exists := s.sessions[sessionID]
+	if !exists {
+		return "", "", false
+	}
+	return prev.KeyID, prev.ParamsVer, true
+}
+
+// IssuedSessions 返回全部“已成功签发过密钥”的会话 ID（字典序，供盘点/测试）。
+func (s *KeyStore) IssuedSessions() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.sessions))
+	for id := range s.sessions {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Get 按 ID 取回“仍在有效期内的 Active 密钥”的副本；
 // 不存在 / 已过期 / 已退役 / 已撤销 / 已销毁各自返回互不相同的 FailureReason，
 // 且一律不返回任何字节。
@@ -180,6 +272,12 @@ func (s *KeyStore) Get(id string) (StoredKey, error) {
 	defer s.mu.Unlock()
 	k, ok := s.keys[id]
 	if !ok {
+		// 记录已被回收：若留有墓碑，按它当初进入不可用的具体原因失败，
+		// 而不是笼统的 not_found——不可用的种类必须一直可区分。
+		if st, buried := s.tombstones[id]; buried {
+			return StoredKey{}, terminalFailure(st, id,
+				"key %q is permanently unusable (reclaimed while %s)")
+		}
 		return StoredKey{}, fail(ReasonKeyNotFound, "key %q not found", id)
 	}
 	if err := s.materializeExpiryLocked(k); err != nil {
@@ -211,6 +309,9 @@ func (s *KeyStore) Retire(id string) error {
 	defer s.mu.Unlock()
 	k, ok := s.keys[id]
 	if !ok {
+		if _, buried := s.tombstones[id]; buried {
+			return s.tombstoneFailureLocked(id, "retire")
+		}
 		return fail(ReasonKeyNotFound, "key %q not found", id)
 	}
 	if err := s.materializeExpiryLocked(k); err != nil {
@@ -239,6 +340,12 @@ func (s *KeyStore) Revoke(id string) error {
 	defer s.mu.Unlock()
 	k, ok := s.keys[id]
 	if !ok {
+		if st, buried := s.tombstones[id]; buried {
+			if st == KeyRevoked {
+				return nil // 记录已作为撤销态被回收，重复撤销幂等
+			}
+			return s.tombstoneFailureLocked(id, "revoke")
+		}
 		return fail(ReasonKeyNotFound, "key %q not found", id)
 	}
 	if err := s.materializeExpiryLocked(k); err != nil {
@@ -265,6 +372,12 @@ func (s *KeyStore) Destroy(id string) error {
 	defer s.mu.Unlock()
 	k, ok := s.keys[id]
 	if !ok {
+		if st, buried := s.tombstones[id]; buried {
+			if st == KeyDestroyed {
+				return nil // 记录已作为销毁态被回收，重复销毁幂等
+			}
+			return s.tombstoneFailureLocked(id, "destroy")
+		}
 		return fail(ReasonKeyNotFound, "key %q not found", id)
 	}
 	if k.State == KeyDestroyed {
@@ -282,6 +395,10 @@ func (s *KeyStore) State(id string) (KeyState, error) {
 	defer s.mu.Unlock()
 	k, ok := s.keys[id]
 	if !ok {
+		// 已回收但留有墓碑：状态结论（expired/retired/revoked/destroyed）仍可查询。
+		if st, buried := s.tombstones[id]; buried {
+			return st, nil
+		}
 		return "", fail(ReasonKeyNotFound, "key %q not found", id)
 	}
 	_ = s.materializeExpiryLocked(k)
@@ -301,6 +418,31 @@ func (s *KeyStore) materializeExpiryLocked(k *StoredKey) error {
 		return fail(ReasonKeyExpired, "key %q has expired at %s", k.ID, k.ExpiresAt)
 	}
 	return nil
+}
+
+// terminalReason 把一个不可用状态映射为其专属、可互相区分的取用失败原因。
+func terminalReason(st KeyState) FailureReason {
+	switch st {
+	case KeyExpired:
+		return ReasonKeyExpired
+	case KeyRetired:
+		return ReasonKeyRetired
+	case KeyRevoked:
+		return ReasonKeyRevoked
+	default: // KeyDestroyed
+		return ReasonKeyDestroyed
+	}
+}
+
+// terminalFailure 按不可用状态构造带原因的错误（format 必须含两个 %s/%v 占位：id、state）。
+func terminalFailure(st KeyState, id, format string) error {
+	return fail(terminalReason(st), format, id, st)
+}
+
+// tombstoneFailureLocked 返回墓碑对应的取用失败错误；调用方必须持有 s.mu。
+func (s *KeyStore) tombstoneFailureLocked(id, action string) error {
+	st := s.tombstones[id]
+	return fail(terminalReason(st), "cannot %s key %q: it was reclaimed as %s and is permanently unusable", action, id, st)
 }
 
 // evictOneLocked 在库满时回收一条密钥为新入库密钥 replacedByID 腾位。
@@ -373,6 +515,9 @@ func (s *KeyStore) evictOneLocked(replacedByID string, now time.Time) error {
 		ReplacedByID: replacedByID,
 		Reason:       "keystore at capacity; reclaimed a non-usable key to make room",
 	}
+	// 删除记录，但把“它为何不可用”的结论落为墓碑永久留存：
+	// 回收只腾位，绝不抹掉不可用结论，同 ID 之后不可能复活。
+	s.tombstones[victim.ID] = victim.State
 	delete(s.keys, victim.ID)
 	s.reclog = append(s.reclog, rec)
 	return nil

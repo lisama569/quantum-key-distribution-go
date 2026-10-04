@@ -29,6 +29,20 @@
   纠错后比特，保密放大输出**长度确定**的密钥。
 - 一个 `Session` 对象**至多产出一把密钥**：再次调用 `Run` 返回
   `session_reused` 错误；失败后重跑同样被拒绝。
+- **会话签发的幂等性以会话 ID 为准，且由密钥库永久记账**：`Manager.RunSession`
+  成功一次后，该 sessionID 在**这个密钥库内永远不可能再产出第二把密钥**——
+  即使它的密钥后来被容量回收、显式退役、撤销、到期清理或销毁，登记都保留；
+  即使之后把管理器升级到新参数版本（`ParamsVersion` 变了、派生出的 KeyID
+  随之不同），会话级登记依旧把第二次签发挡在门外。第二次调用返回
+  `session_reused`（错误信息带当初的 KeyID）。
+  - 去重检查与密钥入库在密钥库的**同一把互斥锁内原子完成**
+    （`KeyStore.IssueSession`），所以多个 goroutine / 多个共享同一库的管理器
+    并发签发同一会话时，**恰有一个成功**，其余全部 `session_reused`，不存在
+    “先查后写”的竞态窗口。
+  - 只有**成功入库**才会记账；协商中止、取消、库满（`keystore_full`）等失败
+    不占用会话名额，排除失败原因后可用同一会话名重试，直到成功一次为止。
+  - 可用 `KeyStore.IssuedSession(id)` / `IssuedSessions()` 查询“谁已经成功
+    签发过”；该记账不随密钥回收而移除，也不占容量。
 - 失败路径（中止、取消、纠错失败、材料不足）会 wipe 掉量子比特、各阶段比特串等
   全部中间材料，密钥库不会写入半成品。
 
@@ -85,7 +99,7 @@
 |---------------|----------|--------------|
 | `config_invalid` | 参数取值非法（阈值范围、批量过小、空密钥、已过期入库等） | 否 |
 | `unsupported_version` | 参数版本不被认识（含重放未知版本记录），与 `config_invalid` 可区分 | 否 |
-| `session_reused` | 同一 `Session` 重复 `Run`，或密钥 ID 冲突 | 否 |
+| `session_reused` | 同一 `Session` 重复 `Run`；密钥 ID 冲突；或**同一会话已成功签发过又被再次提交（含密钥被回收/退役/撤销/到期/销毁之后、参数版本升级之后、并发重复提交）** | 否 |
 | `insufficient_bits` | 筛选后位 < 16、无抽样位，或抽样后不足以构成 `KeyBytes*8` 位 | 否 |
 | `reconcile_failed` | 达到纠错轮数上限双方仍不一致（终验哈希不等） | 否 |
 | `channel_quality_exceeded` | QBER 超阈，且信道诊断**无**窃听拦截事件（判定为固有噪声过差） | 否 |
@@ -123,9 +137,10 @@ BB84 中窃听者（拦截-重发）和噪声都会抬高 QBER。本组件的判
 - 任一会话失败：只归档失败记录，**不写入密钥**；不取消其它会话，也不改动密钥库
   既有内容。`KeyStore` 与 `History` 均为线程安全（互斥 / 读写锁），已通过
   `go test -race` 验证。
-- 容量回收、显式退役/撤销与多个会话并发发生时同样安全：回收判定与入库在同一把
-  互斥锁内原子完成，同一会话不会重复产出密钥，任一会话失败（含库满）不影响其它
-  会话与库内已有密钥。
+- 容量回收、显式退役/撤销与多个会话并发发生时同样安全：会话去重检查、回收判定
+  与入库在同一把互斥锁内原子完成，**同一会话即使被多个 goroutine / 多个共享库的
+  管理器同时提交，也恰有一次成功，其余得到 `session_reused`**；任一会话失败
+  （含库满）不影响其它会话与库内已有密钥，会话之间密钥两两不同。
 
 ### 容量上限与回收策略（长期运行不膨胀）
 
@@ -135,7 +150,15 @@ BB84 中窃听者（拦截-重发）和噪声都会抬高 QBER。本组件的判
   `destroyed → expired → retired → revoked`，同级按“最早到期 → 最早入库 → ID”
   排序。**有效期内的 `active` 密钥永远不会被回收或覆盖。**
 - 若库里全是有效密钥、腾不出空间，本次签发**明确失败**为 `keystore_full`，
-  库内容一字节不变，失败仅写入会话归档（不会悄悄挤掉老密钥）。
+  库内容一字节不变，失败仅写入会话归档（不会悄悄挤掉老密钥，也不留半成品）。
+- **回收只腾位、不抹掉“不可用”的结论**：一条密钥被回收删除时，会留下一块只记
+  状态、不含任何密钥字节、也不占容量的**墓碑（tombstone）**。因此：
+  - 同一 ID 此后**永远不可能**以 `active` 或任何状态重新 `Put` 入库“复活”，
+    容量回收、参数版本升级都不行；尝试入库会按它**当初**的不可用原因
+    （`key_expired` / `key_retired` / `key_revoked` / `key_destroyed`）拒绝；
+  - 记录虽已从库中删除（不再计入 `Len()` / `IDs()`），对它 `Get` 仍返回
+    **当初那一种**可区分的失败原因，而不是笼统的 `key_not_found`；
+    `State(id)` / `Tombstone(id)` 仍能查到其终态结论。
 - 每一次回收都追加一条 `ReclamationRecord` 审计（回收了谁、当时状态、
   回收原因、回收时间、为哪条新密钥腾位），可经 `KeyStore.Reclamations()` 查询。
 
@@ -154,12 +177,16 @@ BB84 中窃听者（拦截-重发）和噪声都会抬高 QBER。本组件的判
 
 | 操作 | 行为 |
 |------|------|
-| `Get(id)` | 仅“未过期的 `active`”可取回（返回字节**副本**）；不存在 / 已过期 / 已退役 / 已撤销 / 已销毁分别返回 **5 个互不相同**的原因，不返回字节 |
+| `Get(id)` | 仅“未过期的 `active`”可取回（返回字节**副本**）；不存在 / 已过期 / 已退役 / 已撤销 / 已销毁分别返回 **5 个互不相同**的原因，不返回字节。**记录即使已被容量回收删除，只要留有墓碑，仍按它当初那一种原因失败（可区分、不复活）**；只有从未入库过的 ID 才是 `key_not_found` |
+| `Put(k)` | 存入一条密钥；ID 已在库报错；**ID 留有墓碑（曾以某不可用状态被回收）时按原终态原因拒绝，杜绝复活** |
+| `IssueSession(sessionID, k)` | 会话签发专用的**原子**入口：同一会话已成功签发过则 `session_reused`，否则在同一把锁内完成容量回收 + 入库 + 会话记账。管理器使用此入口 |
+| `IssuedSession(id)` / `IssuedSessions()` | 查询会话是否已成功签发过（及其 KeyID / 参数版本）；记账永久保留、不随回收移除、不占容量 |
+| `Tombstone(id)` | 查询已回收 ID 留下的终态结论（`expired/retired/revoked/destroyed`）；未回收或从未入库返回 `false` |
 | `Retire(id)` | 显式提前退役并清零字节；记录留存可审计、可被容量回收；幂等；对已撤销/销毁/过期密钥报错 |
 | `Revoke(id)` | 置为 `revoked` 并清零字节；幂等；可从 active/retired 转入；对已销毁/已过期报错 |
 | `Destroy(id)` | 置为终态 `destroyed` 并清零字节；幂等；**此后回收/版本升级都不可能让它恢复可用** |
-| `State(id)` / `IDs()` / `Snapshot()` | 状态查询（会惰性物化过期）/ ID 盘点 / 元数据快照（不带密钥字节） |
-| `Reclamations()` / `ReclaimableCount()` / `Len()` / `Cap()` | 回收审计与容量盘点 |
+| `State(id)` / `IDs()` / `Snapshot()` | 状态查询（会惰性物化过期；墓碑 ID 也可查终态）/ ID 盘点（不含已回收）/ 元数据快照（不带密钥字节） |
+| `Reclamations()` / `ReclaimableCount()` / `Len()` / `Cap()` | 回收审计与容量盘点（墓碑与会话记账均不计入条数/容量） |
 
 - 有效期由 `ManagerConfig.KeyTTL`（`time.Duration`）配置，`<=0` 表示不过期；
   也可在 `StoredKey.ExpiresAt` 上直接给出绝对截止时刻。时钟经
@@ -253,6 +280,27 @@ for _, r := range results {          // 各自独立，互不影响
 }
 ```
 
+会话幂等与“不可用不复活”：
+
+```go
+id1, err := mgr.RunSession(ctx, "session-001")   // 成功，入库 key A
+mgr.Store().Revoke(id1)                          // 撤销 A
+// ……容量回收把 A 的记录删掉后……
+_, err = mgr.RunSession(ctx, "session-001")      // session_reused：绝不会产出第二把
+// 即使另起一个 V2 管理器（共享同一密钥库）也是如此
+
+// 直接往库里写一个与被回收密钥同 ID 的 active 密钥，会被墓碑按原终态拒绝：
+err = mgr.Store().Put(qkd.StoredKey{ID: id1, Key: k, State: qkd.KeyActive})
+// -> key_revoked（曾是 revoked 被回收），不可能复活
+
+if prevKey, ver, ok := mgr.Store().IssuedSession("session-001"); ok {
+    log.Print(prevKey, ver)                       // 会话成功签发记录永久可查
+}
+if state, ok := mgr.Store().Tombstone(id1); ok {  // state == revoked
+    log.Print("reclaimed while ", state)
+}
+```
+
 ---
 
 ## 7. 本地验证方法
@@ -298,6 +346,19 @@ go test -v ./...        # 查看每个用例打印的“输入参数/判定依�
   （管理器构造与记录重放两条路径均可区分）；
 - 🆕 `TestConcurrentSessionsWithReclamation`：并发协商与过期回收/退役同时发生，
   会话不串扰、结论确定、失败不影响其它会话与库内密钥。
+- 🆕 `TestSessionReissueBlockedAfterReclamation`：同一会话成功后，其密钥被
+  撤销/退役/销毁/到期并经容量回收后重跑，一律 `session_reused`，绝不产出第二把；
+- 🆕 `TestTerminalKeysNeverRevive`：撤销/销毁/退役/过期密钥在容量回收之后、
+  以及参数版本升级（V2 管理器、同 ID 重新入库）之后都不复活，取用失败原因
+  始终按当初状态可区分；
+- 🆕 `TestSessionReissueBlockedAcrossVersionUpgrade`：升级到 V2（KeyID 派生
+  结果不同）后同一会话仍不能二次签发，首把 V1 密钥完好；
+- 🆕 `TestConcurrentSessionsNoCrossImpactNoDoubleIssue`：A/B 两组会话在容量
+  受限、并发回收/退役交织下互不影响，成功密钥两两不同、失败只可能是 `keystore_full`；
+- 🆕 `TestConcurrentSameSessionSingleIssue`：同一会话并发提交多次恰有一次成功、
+  其余 `session_reused`，库内只有一把密钥，串行重跑同样被拒；
+- 🆕 `TestFailedSessionCanRetryUntilSuccess`：协商中止不占会话名额、可重试，
+  一旦成功则永久不可再签。
 
 每个用例通过 `t.Logf` 打印 `[输入参数] → [判定依据] → [结论]`，用
 `go test -v` 可看到每个场景的输入、判定依据与结论；`go test -race` 覆盖并发路径。

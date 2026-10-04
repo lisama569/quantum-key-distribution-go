@@ -164,8 +164,17 @@ func TestTerminalStatesNeverRevive(t *testing.T) {
 		t.Fatal(err)
 	}
 	putKey(t, store, "new", ParamsV2, time.Time{}) // 触发回收 rev
-	if _, err := store.Get("rev"); !IsFailure(err, ReasonKeyNotFound) {
-		t.Fatalf("被回收的撤销记录应已删除，实际 %v", err)
+	// 回收删除了库内记录（Len/IDs 不再含 rev，墓碑可查其原结论），
+	// 但 Get 仍按它当初的不可用原因归类为 revoked，而不是笼统的 not_found，
+	// 更不可能复活成 active。
+	if st, buried := store.Tombstone("rev"); !buried || st != KeyRevoked {
+		t.Fatalf("rev 应已被回收并留下 revoked 墓碑，实际 buried=%v state=%s", buried, st)
+	}
+	if got := store.IDs(); containsID(got, "rev") {
+		t.Fatalf("rev 记录应已从库中删除，实际 IDs=%v", got)
+	}
+	if _, err := store.Get("rev"); !IsFailure(err, ReasonKeyRevoked) {
+		t.Fatalf("被回收的撤销记录取用应仍归类 key_revoked（原因可区分、不复活），实际 %v", err)
 	}
 	if _, err := store.Get("alive"); err != nil {
 		t.Fatalf("active 密钥应仍可用: %v", err)

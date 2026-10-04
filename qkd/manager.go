@@ -68,8 +68,30 @@ func (m *Manager) sessionSeed(sessionID string) int64 {
 
 // RunSession 执行单个会话；成功则把密钥入库并归档，失败仅归档失败记录，
 // 绝不写入任何半成品密钥。
+//
+// 会话签发是幂等的：同一 sessionID 在该密钥库内至多成功签发一次。预检与
+// 最终入库都经由 KeyStore 的会话登记判定——即便密钥后来被容量回收、退役、
+// 撤销、到期或销毁，登记仍在，重跑同一会话只会得到 session_reused；
+// 参数版本升级后（派生出不同 KeyID）也同样被会话级登记拦下。
 func (m *Manager) RunSession(ctx context.Context, sessionID string) (string, error) {
 	seed := m.sessionSeed(sessionID)
+	// 快速预检：已成功签发过的会话不再消耗一次协商。
+	// 这只是优化路径；并发下的权威判定在 Store.IssueSession 的原子提交中。
+	if keyID, _, ok := m.cfg.Store.IssuedSession(sessionID); ok {
+		err := fail(ReasonSessionReused,
+			"session %q already issued key %q and can never issue again", sessionID, keyID)
+		m.cfg.History.Add(SessionRecord{
+			Schema:     RecordV1,
+			ID:         sessionID,
+			ParamsVer:  m.cfg.Params.Version,
+			Params:     m.cfg.Params,
+			Seed:       seed,
+			Channel:    m.cfg.Channel,
+			Success:    false,
+			FailReason: ReasonSessionReused,
+		})
+		return "", err
+	}
 	sess, err := NewSession(SessionConfig{
 		ID:     sessionID,
 		Params: m.cfg.Params,
@@ -122,7 +144,10 @@ func (m *Manager) RunSession(ctx context.Context, sessionID string) (string, err
 	if m.cfg.KeyTTL > 0 {
 		stored.ExpiresAt = m.cfg.Clock().Add(m.cfg.KeyTTL)
 	}
-	if putErr := m.cfg.Store.Put(stored); putErr != nil {
+	// 原子提交：会话去重登记 + 密钥入库（含容量回收）在同一把锁内完成。
+	// 即便预检之后、提交之前有另一个管理器/goroutine 抢先签发了同一会话，
+	// 这里也会以 session_reused 失败而不会写入第二把密钥。
+	if putErr := m.cfg.Store.IssueSession(sessionID, stored); putErr != nil {
 		// 入库失败（容量满无法回收 / ID 冲突等）不允许密钥游离在外。
 		// 保留库给出的可区分原因（keystore_full / session_reused 等）。
 		wipe(key)

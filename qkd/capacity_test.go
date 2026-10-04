@@ -2,15 +2,29 @@ package qkd
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
 
-// fakeClock 是测试用可控时钟。
-type fakeClock struct{ t time.Time }
+// fakeClock 是测试用可控时钟；并发测试中可能一边 advance 一边被库读取，
+// 故自带互斥保护。
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
 
-func (c *fakeClock) now() time.Time          { return c.t }
-func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
 
 // putKey 是测试辅助：直接向库存入一条 active 密钥。
 func putKey(t *testing.T, s *KeyStore, id string, ver ParamsVersion, exp time.Time) {
@@ -21,6 +35,16 @@ func putKey(t *testing.T, s *KeyStore, id string, ver ParamsVersion, exp time.Ti
 	}); err != nil {
 		t.Fatalf("Put(%s) 失败: %v", id, err)
 	}
+}
+
+// containsID 判断有序 ID 列表中是否包含某 ID（测试盘点辅助）。
+func containsID(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }
 
 // TestCapacityEvictsOnlyInvalidKeys 容量上限：库满后只能回收已失效/已退役密钥，
@@ -62,13 +86,17 @@ func TestCapacityEvictsOnlyInvalidKeys(t *testing.T) {
 	}
 	putKey(t, store, "k4", ParamsV2, time.Time{})
 
-	// k1 被回收后记录已删除：Get/State 均为 not_found；
-	// “它是因为过期才被回收”的判定依据保留在回收审计中。
-	if _, gerr := store.Get("k1"); !IsFailure(gerr, ReasonKeyNotFound) {
-		t.Fatalf("k1 记录应已被回收删除（not_found），实际错误: %v", gerr)
+	// k1 被回收后库内记录已删除，但留有 expired 墓碑：Get/State 仍按
+	// “它当初是过期才不可用”归类（key_expired），而不是笼统的 not_found，
+	// 更不会因腾挪复活；“为什么被回收”同时保留在回收审计中。
+	if st, buried := store.Tombstone("k1"); !buried || st != KeyExpired {
+		t.Fatalf("k1 应已被回收并留下 expired 墓碑，实际 buried=%v state=%s", buried, st)
 	}
-	if st, err := store.State("k1"); err == nil {
-		t.Fatalf("k1 记录应已被删除，却仍能查到状态 %s", st)
+	if _, gerr := store.Get("k1"); !IsFailure(gerr, ReasonKeyExpired) {
+		t.Fatalf("k1 已被回收，取用应归类 key_expired（原因可区分、不复活），实际错误: %v", gerr)
+	}
+	if st, err := store.State("k1"); err != nil || st != KeyExpired {
+		t.Fatalf("k1 墓碑状态应可查为 expired，实际 state=%s err=%v", st, err)
 	}
 	for _, id := range []string{"k2", "k3", "k4"} {
 		if _, gerr := store.Get(id); gerr != nil {
